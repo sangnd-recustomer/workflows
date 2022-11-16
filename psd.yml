@@ -1,0 +1,73 @@
+
+name: Deploy ECS
+
+on:
+  push:
+    branches: [ "master", "staging", "develop" ]
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: false
+
+
+jobs:
+
+  build:
+    runs-on: ubuntu-20.04
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+    - uses: actions/checkout@v3
+    - name: Import config
+      shell: bash
+      run: |
+        ENV_FILE=.github/workflows/${{ github.ref_name }}.env
+        if [ -f "$ENV_FILE" ] ; then cat "$ENV_FILE" >> $GITHUB_ENV ; fi
+
+    - name: Make Docker tags
+      id: docker-meta
+      uses: docker/metadata-action@v4
+      with:
+        images: |
+          ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}
+        tags: |
+          type=ref,event=branch
+          type=sha,prefix=g-,format=short
+
+    - uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-region: ${{ env.ECR_REGION }}
+        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+        role-duration-seconds: 900
+    - uses: aws-actions/amazon-ecr-login@v1
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+    - name: Build and push to ECR
+      uses: docker/build-push-action@v3
+      with:
+        push: true
+        cache-from: type=gha
+        cache-to: type=gha
+        tags: ${{ steps.docker-meta.outputs.tags }}
+
+    - name: Redeploy ECS (production)
+      if: github.ref_name == 'master'
+      run: |
+        pip install boto3~=1.24.44
+        .github/workflows/deploy_ecs_prod.py
+
+    - name: Redeploy dev server
+      if: github.ref_name == 'develop'
+      run: aws ssm send-command
+        --comment "Run deploy script in server"
+        --instance-ids "$DEV_SERVER_INSTANCE"
+        --document-name "AWS-RunShellScript"
+        --parameters "commands='runuser -u $DEPLOY_CMD_USER $DEPLOY_CMD',workingDirectory=$DEPLOY_CMD_WORKDIR"
+        --cloud-watch-output-config "CloudWatchOutputEnabled=true,CloudWatchLogGroupName=/aws/ssm/cne-dev-be/send-command/AWS-RunShellScript"
+
